@@ -198,8 +198,8 @@ class StateMonitor(object):
         global last_data_from_tesla
         a_lat = None
         a_long = None
+        
         # Request and process all Tesla states
-        any_change = False
         logger.debug('>> Request vehicle data')
         r = self.vehicle.get('vehicle_data')
 
@@ -223,7 +223,6 @@ class StateMonitor(object):
                 'time': int(timestamp) * 1000000,
             }
             for element in sorted(result):
-                element_changed = False
 
                 if element not in ('timestamp', 'gps_as_of', 'left_temp_direction', 'right_temp_direction', 'charge_port_latch'):
                     old_value = self.old_values[request].get(element, '')
@@ -240,40 +239,18 @@ class StateMonitor(object):
                     if element == 'vehicle_name' and not new_value:
                         continue
                     
-                    # These properties don't warrant waking up for
-                    elif element in ['inside_temp','outside_temp','battery_range','est_battery_range','ideal_battery_range','minutes_to_full_charge','time_to_full_charge']:
-                        element_changed = False
-
                     # Speed
                     elif element == 'speed' and new_value == None:
                         # Non speed reading so assume 0
                         new_value = 0
-                   
-                    # Charger values
-                    elif (element in ['charger_voltage'] and abs(new_value - old_value if old_value != '' else 0) < 5.0):
-                        logger.debug('Only minimal difference detected in {}. No change registered to avoid wakelock.'.format(element))
-                        element_changed = False
-
-                    elif (element in ['charger_power', 'charger_voltage', 'charger_actual_current'] and abs(new_value - old_value if old_value != '' else 0) < 2.0):
-                        logger.debug('Only minimal difference detected in {}. No change registered to avoid wakelock.'.format(element))
-                        element_changed = False
-                                                     
+                                                                       
                     # Catch changes to other values        
                     elif new_value != old_value:
                         if (new_value == None):
                             # Should we use the old value instead?
                             if element in ['shift_state']:
                                 logger.debug('Failed to read {}, will assume it hasn\'t changed for now'.format(element))
-                                new_value = old_value
-                            else:
-                                element_changed = True
-                        else:
-                            element_changed = True                
-
-                    # Any changes?
-                    if element_changed:                            
-                        logger.debug('Value change detecte for {} - old value: {} - new value: {} '.format(element, str(old_value), str(new_value)))
-                        any_change = True
+                                new_value = old_value            
 
                     # Write new values
                     if new_value is not None:
@@ -303,7 +280,10 @@ class StateMonitor(object):
                 logger.info('Writing Points to Influx: ' + json_body['measurement'])
                 influx_client.write_points([json_body])
 
-        return any_change
+        # What state are we in?
+        current_state = self.ongoing_activity_status()
+
+        return (current_state.lower() != 'idle')
 
     def check_states(self, interval):
         # Check all Tesla States
