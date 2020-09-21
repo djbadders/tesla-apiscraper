@@ -1,8 +1,17 @@
-""" apiscraper.py - log all Tesla data available from the
+''' apiscraper.py - log all Tesla data available from the
     Mothership API to Influx.
 
-    Author: Bastian Maeuser
+    Origianl Author: Bastian Maeuser
     https://github.com/lephisto/tesla-apiscraper
+
+    Modified version: https://github.com/djbadders/tesla-apiscraper
+    Author: Dave Baddeley
+
+    Changed to:
+    * remove web server for mobile app
+    * enhanced sleep behaviour
+    * support for tracking mulitple vehicles
+    * Auto log rotation and limited disk usage
 
     Please note that the use of the Tesla REST API in general
     and the use of this software in particular is not endorsed by Tesla.
@@ -15,158 +24,171 @@
 
     Configuration is taken from config.py - a sample file is distributed as
     config.py.dist. Rename it and configure it according your needs.
-
-"""
+'''
 
 import json
+import coloredlogs
 import logging
-import queue
+import logging.handlers
 import sys
 import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.error import URLError
+import teslajson
+import polling
 
 from influxdb import InfluxDBClient
+from urllib.error import URLError
 from urllib3.exceptions import HTTPError
-
-import teslajson
 from config import *
+from teslajson import ContinuePollingError
 from srtmread import elevationtoinflux
 
-a_vin = ""
-a_display_name = ""
-a_ignore = ["media_state", "software_update", "speed_limit_mode"]
+# Initialise
+a_vin = ''
+a_display_name = ''
+a_ignore = ['media_state', 'software_update', 'speed_limit_mode']
 
 a_validity_checks = {
-    "charger_voltage":
+    'charger_voltage':
         {
-            "eval": "new_value < 10",
-            "set": 0
+            'eval': 'new_value < 0',
+            'set': 0
         }
 }
 
-postq = queue.Queue()
-http_condition = threading.Condition()
-
-poll_interval = 1  # Set to -1 to wakeup the Car on Scraper start
-poll_count = 0     # Track pollcounting
-asleep_since = 0
-is_asleep = ''
-disableScrape = a_start_disabled
-disabled_since = 0
+poll_interval = a_awake_poll_secs  # Set to -1 to wakeup the Car on Scraper start
+asleep_since = int(time.time())
+next_wakeup = int(time.time()) + a_maximum_sleep
+scheduled_charge_time = None
+previous_car_state = ''
 busy_since = 0
-car_active_state = None
+car_active_status = None
 last_data_from_tesla = None
-resume = False
 
-# DON'T CHANGE ANYTHING BELOW
-scraper_api_version = 2019.5
+# Tesla API scraper version
+scraper_api_version = 2020.9
 
-influx_client = InfluxDBClient(
-    a_influx_host, a_influx_port, a_influx_user, a_influx_pass, a_influx_db)
+# Database initialise
+influx_client = None
+if not a_dry_run:
+    influx_client = InfluxDBClient(a_influx_host, a_influx_port, a_influx_user, a_influx_pass, a_influx_db)
 
-
+# Logger
 def setup_custom_logger(name):
-    formatter = logging.Formatter(fmt='%(asctime)s %(levelname)-8s %(message)s',
-                                  datefmt='%Y-%m-%d %H:%M:%S')
-    handler = logging.FileHandler(a_logfile, mode='a')
-    handler.setFormatter(formatter)
-    screen_handler = logging.StreamHandler(stream=sys.stdout)
-    screen_handler.setFormatter(formatter)
+    coloredlogs.install(a_loglevel)
     custom_logger = logging.getLogger(name)
     custom_logger.setLevel(a_loglevel)
-    custom_logger.addHandler(handler)
-    custom_logger.addHandler(screen_handler)
-    return custom_logger
 
+    # Add file logger if required
+    if a_max_log_files_size > 0:    
+        formatter = logging.Formatter(fmt='%(asctime)s %(levelname)-8s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        handler = logging.handlers.RotatingFileHandler(a_logfile, 'a', int((a_max_log_files_size * 1024) / 2), 2, None, False)
+        handler.setFormatter(formatter)        
+        custom_logger.addHandler(handler)
+
+    return custom_logger
 
 logger = setup_custom_logger('apiscraper')
 
+# Functions
+def calculate_next_wakeup(current_wake_up_time, state_monitor):
+    wakeup_time = int(time.time()) + a_maximum_sleep            
 
+    # If we have scheduled charging, lets wake up just in time to catch that activity.
+    if state_monitor.old_values['charge_state'].get('scheduled_charging_pending', False):
+        scheduled_charge_time = state_monitor.old_values['charge_state'].get('scheduled_charging_start_time', 0)
+
+        if scheduled_charge_time > 0 and scheduled_charge_time < wakeup_time:
+            wakeup_time = scheduled_charge_time
+
+            if scheduled_charge_time != current_wake_up_time:
+                logger.info('Scheduled charging due at {0} will wake up then!'.format(time.ctime(wakeup_time)))
+
+    return wakeup_time
+
+# Tesla car state monitor
 class StateMonitor(object):
-    """ Monitor all Tesla states."""
-
-    def __init__(self, tesla_email, tesla_password):
-        self.requests = ("charge_state", "climate_state", "drive_state",
-                         "gui_settings", "vehicle_state")
-        self.priority_requests = {1: ("drive_state",),
-                                  2: ("drive_state",),
-                                  4: ("charge_state", "drive_state",)}
+    # Monitor all Tesla states.
+    def __init__(self, tesla_email, tesla_password, vehicle_index):
+        self.requests = ('charge_state', 'climate_state', 'drive_state',
+                         'gui_settings', 'vehicle_state')
+        self.priority_requests = {1: ('drive_state',),
+                                  2: ('drive_state',),
+                                  4: ('charge_state', 'drive_state',)}
         self.old_values = dict([(r, {}) for r in self.requests])
 
         self.connection = teslajson.Connection(tesla_email, tesla_password)
-        self.vehicle = self.connection.vehicles[a_tesla_car_idx]
+        self.vehicle = self.connection.vehicles[vehicle_index]
+        self.vehicle_index = vehicle_index
+        self.pollTimes = [ 2, 5, 15, 30, 45, 60, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 2000, 120 ]
+        self.noChangesPollCount = 0
 
     def refresh_vehicle(self):
         # refreshes the vehicle object
-        logger.info(">> self.connection.refresh_vehicle()")
-        self.connection.refresh_vehicle()
-        self.vehicle = self.connection.vehicles[a_tesla_car_idx]
+        logger.debug('>> self.connection.refresh_vehicle()')
+        self.vehicle = self.connection.vehicles[self.vehicle_index]
 
     def ongoing_activity_status(self):
-        """ True if the car is not in park, or is actively charging ... """
+        # True if the car is not in park, or is actively charging ...
         shift = self.old_values['drive_state'].get('shift_state', '')
         old_speed = self.old_values['drive_state'].get('speed', 0) or 0
-        if shift == "R" or shift == "D" or shift == "N" or old_speed > 0:
-            return "Driving"
-        if self.old_values['charge_state'].get('charging_state', '') in [
-            "Charging", "Starting"]:
-            return "Charging"
+
+        if shift == 'R' or shift == 'D' or shift == 'N' or old_speed > 0:
+            return 'driving'
+
+        # Check charging status
+        if self.old_values['charge_state'].get('charging_state', '').lower() in ['charging', 'starting']:
+            return 'charging'
+
         # If we just completed the charging, need to wait for voltage to
         # go down to zero too to avoid stale value in the DB.
-        if (self.old_values['charge_state'].get('charging_state', '') == "Complete" or self.old_values[
-            'charge_state'].get('charging_state', '') == "Stopped") \
-                or self.old_values['charge_state'].get('charger_voltage', 0) > 0 or self.old_values['charge_state'].get('charger_actual_current', 0) > 0:
-            return "Charging"
+        if (self.old_values['charge_state'].get('charger_voltage', 0) > 10 and \
+            self.old_values['charge_state'].get('charger_actual_current', 0) > 0):
+            return 'charging'
 
-        if self.old_values['climate_state'].get('is_climate_on', False):
-            return "Conditioning"
         # When it's about time to start charging, we want to perform
         # several polling attempts to ensure we catch it starting even
         # when scraping is otherwise disabled
         if self.old_values['charge_state'].get('scheduled_charging_pending', False):
             scheduled_time = self.old_values['charge_state'].get('scheduled_charging_start_time', 0)
             if abs(scheduled_time - int(time.time())) <= 2:
-                return "Charging"
+                return 'charging'
+
+        # Pre-conditioning?
+        if self.old_values['climate_state'].get('is_climate_on', False):
+            return 'conditioning'        
 
         # If screen is on, the car is definitely not sleeping so no
         # harm in polling it as long as values are changing
-        if self.old_values['vehicle_state'].get('center_display_state', 0) != 0:
-            return "Screen On"
+        if self.old_values['vehicle_state'].get('center_display_state', 0) not in [0, 5]:
+            if self.old_values['vehicle_state'].get('center_display_state') == 2:
+                return 'screen on (normal)'
+            if self.old_values['vehicle_state'].get('center_display_state') == 3:
+                return 'screen on (charging)'
+            if self.old_values['vehicle_state'].get('center_display_state') == 7:
+                return 'screen on (sentry)' 
+            if self.old_values['vehicle_state'].get('center_display_state') == 8:
+                return 'screen on (dog mode)'
+            else:
+                return 'screen on'
 
-        return None
+        return 'idle'
 
     def wake_up(self):
-        """ mod """
-        global a_vin
-        global a_display_name
-        """ end mod """
-        """ Request wake up of car. """
-        delay = 1
-        while True:
-            try:
-                result = self.vehicle.wake_up()["response"]
-                logger.info("wake_up")
-                for element in sorted(result):
-                    logger.debug("   %s=%s" % (element, result[element]))
-                    """ mod """
-                    if element == "vin":
-                        a_vin = result[element]
-                    if element == "display_name":
-                        a_display_name = result[element]
-                return
-            except (KeyError, HTTPError, URLError) as details:
-                delay *= 2
-                logger.warning("HTTP Error:" + str(details))
-                logger.info("Waiting %d seconds before retrying." % delay)
-                time.sleep(delay)
+        # Request wake up of car. #
+        logger.debug('wake_up')
+        try:
+            self.vehicle.wake_up()
+            return True
+        except (polling.TimeoutException):
+            logger.debug('Vehicle not waking up')
+            return False
 
     def update_vehicle_from_response(self, response):
         # The other vehicle items are pretty much static.
         # We don't need to do any db insertions here, the main loop
         # would perform those for us.
-        for item in ["state", "display_name"]:
+        for item in ['state', 'display_name']:
             self.vehicle[item] = response[item]
 
     def request_state_group(self):
@@ -178,13 +200,12 @@ class StateMonitor(object):
         a_long = None
         # Request and process all Tesla states
         any_change = False
-        logger.debug(">> Request vehicle data")
-        r = self.vehicle.get("vehicle_data")
+        logger.debug('>> Request vehicle data')
+        r = self.vehicle.get('vehicle_data')
 
         self.update_vehicle_from_response(r['response'])
 
         for request in self.requests:
-            header_printed = False
             result = r['response'][request]
             timestamp = result['timestamp']
             last_data_from_tesla = timestamp
@@ -192,357 +213,259 @@ class StateMonitor(object):
                 break
             self.old_values[request]['timestamp'] = timestamp
             json_body = {
-                "measurement": request,
-                "tags": {
-                    "vin": a_vin,
-                    "display_name": a_display_name,
+                'measurement': request,
+                'tags': {
+                    'vin': a_vin,
+                    'display_name': a_display_name,
                 },
-                "fields": {
+                'fields': {
                 },
-                "time": int(timestamp) * 1000000,
+                'time': int(timestamp) * 1000000,
             }
             for element in sorted(result):
-                if element not in (
-                        "timestamp", "gps_as_of", "left_temp_direction", "right_temp_direction", "charge_port_latch"):
+                element_changed = False
+
+                if element not in ('timestamp', 'gps_as_of', 'left_temp_direction', 'right_temp_direction', 'charge_port_latch'):
                     old_value = self.old_values[request].get(element, '')
                     new_value = result[element]
-                    if element == "vehicle_name" and not new_value:
-                        continue
-                    if element == "native_latitude":
+
+                    # Location
+                    if element == 'native_latitude':
                         a_lat = new_value
-                    if element == "native_longitude":
+
+                    if element == 'native_longitude':
                         a_long = new_value
-                    if new_value and old_value and ((element == "inside_temp") or (element == "outside_temp")):
-                        if abs(new_value - old_value) < 1.0:
-                            new_value = old_value
-                            logger.debug(
-                                "Only minimal temperature difference received. No change registered to avoid wakelock.")
-                    if new_value and old_value and (
-                            (element == "battery_range") or
-                            (element == "est_battery_range") or
-                            (element == "ideal_battery_range")
-                    ):
-                        if abs(new_value - old_value) < 0.5:
-                            new_value = old_value
-                            logger.debug(
-                                "Only minimal range difference received. No change registered to avoid wakelock.")
-                    if (old_value == '') or ((new_value is not None) and (new_value != old_value)) or \
-                            ((request == 'charge_state' and result['charging_state'] == 'Charging') and (element in ['charger_power', 'charger_voltage', 'charger_actual_current'])):
-                        logger.debug("Value Change, SG: " + request + ": Logging..." + element +
-                                    ": old value: " + str(old_value) + ", new value: " + str(new_value))
-                        if not header_printed:
-                            header_printed = True
-                            any_change = True
-                        if new_value is not None:
-                            if element not in a_ignore:
-                                if element in a_validity_checks and eval(a_validity_checks[element]["eval"]):
-                                    logger.debug(
-                                        "VALIDITY CHECK VIOLATED >>> " + element + ":" + a_validity_checks[element][
-                                            "eval"])
-                                    new_value = a_validity_checks[element]["set"]
-                                row = { element: new_value }
-                                json_body["fields"].update(row)
-                        self.old_values[request][element] = new_value
+
+                    # Skip vehicle name
+                    if element == 'vehicle_name' and not new_value:
+                        continue
+                    
+                    # These properties don't warrant waking up for
+                    elif element in ['inside_temp','outside_temp','battery_range','est_battery_range','ideal_battery_range','minutes_to_full_charge','time_to_full_charge']:
+                        element_changed = False
+
+                    # Speed
+                    elif element == 'speed' and new_value == None:
+                        # Non speed reading so assume 0
+                        new_value = 0
+                   
+                    # Charger values
+                    elif (element in ['charger_voltage'] and abs(new_value - old_value if old_value != '' else 0) < 5.0):
+                        logger.debug('Only minimal difference detected in {}. No change registered to avoid wakelock.'.format(element))
+                        element_changed = False
+
+                    elif (element in ['charger_power', 'charger_voltage', 'charger_actual_current'] and abs(new_value - old_value if old_value != '' else 0) < 2.0):
+                        logger.debug('Only minimal difference detected in {}. No change registered to avoid wakelock.'.format(element))
+                        element_changed = False
+                                                     
+                    # Catch changes to other values        
+                    elif new_value != old_value:
+                        if (new_value == None):
+                            # Should we use the old value instead?
+                            if element in ['shift_state']:
+                                logger.debug('Failed to read {}, will assume it hasn\'t changed for now'.format(element))
+                                new_value = old_value
+                            else:
+                                element_changed = True
+                        else:
+                            element_changed = True                
+
+                    # Any changes?
+                    if element_changed:                            
+                        logger.debug('Value change detecte for {} - old value: {} - new value: {} '.format(element, str(old_value), str(new_value)))
+                        any_change = True
+
+                    # Write new values
+                    if new_value is not None:
+                        if element not in a_ignore:
+                            if element in a_validity_checks and eval(a_validity_checks[element]['eval']):
+                                logger.debug(
+                                    'VALIDITY CHECK VIOLATED >>> ' + element + ':' + a_validity_checks[element]['eval'])
+                                new_value = a_validity_checks[element]['set']
+                            row = {element: new_value}
+                            json_body['fields'].update(row)
+                    self.old_values[request][element] = new_value
+
                 if a_lat is not None and a_long is not None and a_resolve_elevation:
                     # Fire and forget Elevation retrieval..
-                    logger.debug("starting thread elevator: " + str(a_lat) + "/" + str(a_long) + "/" + str(timestamp))
+                    logger.debug('starting thread elevator: ' + str(a_lat) + '/' + str(a_long) + '/' + str(timestamp))
                     elevator = threading.Thread(target=elevationtoinflux,
-                                                args=(
-                                                    a_lat, a_long, a_vin, a_display_name,
+                                                args=(a_lat, a_long, a_vin, a_display_name,
                                                     timestamp, influx_client, a_dry_run, logger))
                     # elevator.daemon = True
-                    elevator.setName("elevator")
+                    elevator.setName('elevator')
                     if not elevator.is_alive():
                         elevator.start()
                     a_lat = None
                     a_long = None
 
-            if not a_dry_run and len(json_body["fields"])>0:
-                logger.info("Writing Points to Influx: " + json_body["measurement"])
+            if not a_dry_run and len(json_body['fields']) > 0:
+                logger.info('Writing Points to Influx: ' + json_body['measurement'])
                 influx_client.write_points([json_body])
+
         return any_change
 
     def check_states(self, interval):
         # Check all Tesla States
         any_change = False
-        try:
-            if self.request_state_group():
-                any_change = True
-            else:
-                shift = self.old_values['drive_state'].get('shift_state', '')
-                if shift == "R" or shift == "D":
-                    # We are actively driving, does not matter we are
-                    # stopped at a traffic light or whatnot,
-                    # keep polling
-                    interval = 1
-                    any_change = True
 
-        except (HTTPError, URLError) as exc:
-            logger.info("HTTP Error: " + str(exc))
+        try:
+            # Get latest states
+            any_change = self.request_state_group()
+
+            # Check for driving
+            shift = self.old_values['drive_state'].get('shift_state', '')
+            if shift == 'R' or shift == 'D':
+                # We are actively driving, does not matter we are
+                # stopped at a traffic light or whatnot,
+                # keep polling
+                interval = a_awake_poll_secs
+                any_change = True
+
+        except ContinuePollingError:
+            # Timeouts trying to talk to the vehicle
+            logger.info('Timeout contacting vehicle will try again, assuming asleep now')
+            self.vehicle['state'] = 'asleep'
+
+        except HTTPError as ex:
+            logger.info('Error calling Tesla API: {0}'.format(ex))
             if a_allow_sleep == 1:
                 return interval
             else:
                 return -1  # re-initialize.
 
         if interval == 0:
-            interval = 1
+            interval = a_awake_poll_secs
 
         # If we are charging at a supercharger, it's worth polling frequently
-        # since the changes are fast. For regular charging 16 seconds
-        # interval seems to be doing ok on my 72A/16kW charger, perhaps
-        # we can even poll every 32 seconds on 40A and below? Polling
-        # based on values changing is not good because there's constant +-1V
-        # jitter on the source power that results in needless overhead
-        if self.old_values['charge_state'].get('charging_state', '') == "Charging":
-            if self.old_values['charge_state'].get('fast_charger_present', '') == "true":
-                interval = 2
+        # since the changes are fast. 
+        if self.old_values['charge_state'].get('charging_state', '').lower() == 'charging':
+            if self.old_values['charge_state'].get('fast_charger_present', '') == 'true':
+                interval = 5
             else:
-                interval = 16
+                interval = 15
 
         # If we are not charging (and not moving), then we can use the
         # usual logic to determine how often to poll based on how much
         # activity we see.
         else:
             if any_change:  # there have been changes, reduce interval
-                if interval > 1:
-                    interval /= 2
+                interval = a_awake_poll_secs
+                self.noChangesPollCount = 0
+
             else:  # there haven't been any changes, increase interval to allow the car to fall asleep
-                if interval < 2048:
-                    interval *= 2
+                self.noChangesPollCount += 1
+                if (self.noChangesPollCount - 1) < len(self.pollTimes):
+                    interval = self.pollTimes[(self.noChangesPollCount - 1)]
+                else:
+                    interval = self.pollTimes[(len(self.pollTimes) - 1)]
+
         return interval
 
-
-'''
-def last_state_report(f_vin):
-    raw_query = "select time,state from vehicle_state where metric='state' and vin='{}' order by time desc limit 1"
-    query = raw_query.format(f_vin)
-    influx_result = influx_client.query(query)
-    point = list(influx_result.get_points(measurement='vehicle_state'))
-    return point[0]
-'''
-
-
-# HTTP Thread Handler
-class ApiHandler(BaseHTTPRequestHandler):
-
-    def do_HEAD(self):
-        self.send_response(200)
-        self.send_header("Content-type", "application/json")
-        self.end_headers()
-
-    def do_GET(self):
-        if self.path == "/state" and self.headers.get('apikey') == a_api_key:
-            self.send_response(200)
-            busy_since_copy = busy_since
-            if busy_since_copy:
-                processing_time = int(time.time()) - busy_since_copy
-            else:
-                processing_time = 0
-            api_response = [
-                {
-                    "result": "ok",
-                    "vin": a_vin,
-                    "scraperapiversion": scraper_api_version,
-                    "displayname": a_display_name,
-                    "state": is_asleep,
-                    "disablescraping": disableScrape,
-                    "carstate": car_active_state,
-                    "disabled_since": disabled_since,
-                    "interval": poll_interval,
-                    "lastdatafromtesla": int(last_data_from_tesla/1000),
-                    "busy": processing_time
-                }
-            ]
-        else:
-            self.send_response(400)
-            api_response = [
-                {
-                    "result": "fail"
-                }
-            ]
-        self.send_header("Content-type", "application/json")
-        self.end_headers()
-        byt = json.dumps(api_response, indent=4).encode()
-        self.wfile.write(byt)
-
-    # todo
-    def do_POST(self):
-        if self.path == "/switch" and self.headers.get('apikey') == a_api_key:
-            content_length = int(self.headers['Content-Length'])
-            body = self.rfile.read(content_length)
-            post_command = json.loads(body.decode())
-            if post_command['command'] is not None:
-                self.send_response(200)
-                self.server.condition.acquire()
-                self.server.pqueue.put(body)
-                self.server.condition.notify()
-                self.server.condition.release()
-            else:
-                self.send_response(401)
-        else:
-            self.send_response(400)
-        self.end_headers()
-
-
-class QueuingHTTPServer(HTTPServer):
-    def __init__(self, server_address, RequestHandlerClass, pqueue, cond, bind_and_activate=True):
-        HTTPServer.__init__(self, server_address, RequestHandlerClass, bind_and_activate)
-        self.pqueue = postq
-        self.condition = cond
-
-
-def run_server(port, pq, cond):
-    httpd = QueuingHTTPServer(('0.0.0.0', port), ApiHandler, pq, cond)
-    while True:
-        logger.debug("HANDLE: " + threading.current_thread().name)
-        httpd.handle_request()
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     # Create Tesla API Interface
     try:
-        state_monitor = StateMonitor(a_tesla_email, a_tesla_password)
+        state_monitor = StateMonitor(a_tesla_email, a_tesla_password, a_tesla_car_idx)
     except:
-        sys.exit("Failed to initialize Owner API")
-    main_loop_count = 0
+        logger.error('Failed to initialize Owner API; please check your Tesla account details in the config.py file: ' + str(sys.exc_info()[0]))
+        sys.exit('Failed to initialize Owner API; please check your Tesla account details in the config.py file')
 
-    # Create HTTP Server Thread
-    if a_enable_api:
-        thread = threading.Thread(target=run_server, args=(a_api_port, postq, http_condition))
-        thread.daemon = True
-        try:
-            thread.start()
-            logger.info("HTTP Server Thread started on port " + str(a_api_port))
-        except KeyboardInterrupt:
-            sys.exit(0)
-    elif disableScrape:
-        sys.exit("Configuration error: Scraping disabled and no api configured to enable. Bailing out")
-
-# Main Program Loop. messy..
+# Main Program Loop
+first_run = True
 while True:
+    # Initialise loop    
+    busy_since = int(time.time())
 
-    # We need to store this state in this global variable to ensure
-    # HTTP thread is able to see it in real time as well.
-    car_active_state = state_monitor.ongoing_activity_status()
+    # Get vehicle details and state
+    state_monitor.refresh_vehicle()
 
-    # Look if there's something from the Webservers Post Queue
-    while not postq.empty():
-        req = json.loads(postq.get().decode())
-        command = req['command']
-        val = req['value']
-        logger.info("Command Queue not empty: " + command + ", value: " + str(val))
-        if command == "scrape":
-            disableScrape = req['value']
-            if not disableScrape:
-                logger.info("Resume Scrape requested")
-                poll_interval = 1
-                disabled_since = 0
-                resume = True
-            else:
-                logger.info("Stop Scrape requested")
-                disabled_since = (int(time.time()))
-        if command == "oneshot":
-            # Just override the car_active_state for a single
-            # round of requests
-            car_active_state = "oneshot request"
-            logger.info("Oneshot update requested")
-            if is_asleep == "asleep":
-                logger.info("Waking the car up for the oneshot request")
-                state_monitor.wake_up()
-                resume = True
+    # Get latest data from vehicle
+    poll_interval = state_monitor.check_states(poll_interval)   
+    car_active_status = state_monitor.ongoing_activity_status()
 
-    if disableScrape is False or car_active_state is not None:
-        busy_since = int(time.time())
-        # We cannot be sleeping with small poll interval for sure.
-        # In fact can we be sleeping at all if scraping is enabled?
-        if poll_interval >= 64 or resume:
-            try:
-                state_monitor.refresh_vehicle()
-            except:
-                logger.info("Hostname Exception Caught")
-        # Car woke up
-        if is_asleep == 'asleep' and state_monitor.vehicle['state'] == 'online':
-            poll_interval = 0
-            asleep_since = 0
+    # Should be forcing a refresh? 
+    if (int(time.time()) > next_wakeup) or first_run:
+        # Wake up the vehicle
+        logger.info('Waking the vehicle to check status')
 
-        if state_monitor.vehicle['state'] == 'asleep' and is_asleep == 'online':
-            asleep_since = time.time()
+        # Set next wake up time
+        next_wakeup = calculate_next_wakeup(next_wakeup, state_monitor)
 
-        is_asleep = state_monitor.vehicle['state']
-        a_vin = state_monitor.vehicle['vin']
-        a_display_name = state_monitor.vehicle['display_name']
-        ts = int(time.time()) * 1000000000
-        state_body = [
-            {
-                "measurement": 'vehicle_state',
-                "tags": {
-                    "vin": state_monitor.vehicle['vin'],
-                    "display_name": state_monitor.vehicle['display_name']
-                },
-                "time": ts,
-                "fields": {
-                    "state": is_asleep
-                }
-            }
-        ]
-        if not a_dry_run:
-            influx_client.write_points(state_body)
-        logger.debug("Car State: " + is_asleep +
-                    " Poll Interval: " + str(poll_interval))
-        if is_asleep == 'asleep' and a_allow_sleep == 1:
-            logger.debug("Car is probably asleep, we let it sleep...")
-            poll_interval = 64
-
-        if poll_interval >= 0:
-            if is_asleep != 'asleep':
-                poll_interval = state_monitor.check_states(poll_interval)
-                resume = False
-        elif poll_interval < 0:
-            state_monitor.wake_up()
-            poll_interval = 1
-        to_sleep = poll_interval
-        processing_time = int(time.time()) - busy_since
-        # If we spent too much time in processing, warn here
-        # Reasons might be multiple like say slow DB or slow tesla api
-        if processing_time > 10:
-            logger.info("Too long processing loop: " + str(processing_time) +
-                        " seconds... Tesla server or DB slow?")
-        logger.info("Asleep since: " + str(asleep_since) +
-                    " Sleeping for " + str(poll_interval) + " seconds..")
-        busy_since = 0
-    else:
-        # If we have scheduled charging, lets wake up just in time
-        # to catch that activity.
-        if state_monitor.old_values['charge_state'].get('scheduled_charging_pending', False):
-            to_sleep = state_monitor.old_values['charge_state'].get('scheduled_charging_start_time', 0) - int(
-                time.time())
-            # This really should not happen
-            if to_sleep <= 0:
-                to_sleep = None
-            else:
-                logger.info("Going to sleep " + str(to_sleep) + " seconds until a scheduled charge")
+        # Call Wake_up
+        if state_monitor.wake_up():
+            # Car awake
+            logger.info('Vehicle awake')
+            poll_interval = a_awake_poll_secs            
         else:
-            to_sleep = None
+            # Car didn't wake
+            logger.info('Vehicle didn\'t wake up :(')
 
-    # Look if there's something from the Webservers Post Queue
-    http_condition.acquire()
-    if not postq.empty():
-        # Need to turn around and do another round of processing
-        # right away.
-        http_condition.release()
-        continue
+    # Car woke up
+    if previous_car_state == 'asleep' and state_monitor.vehicle['state'] == 'online':
+        poll_interval = a_awake_poll_secs
+        asleep_since = None
 
-    # Using to_sleep value ensures we don't miss the active car state here
-    # even if disableScrape changed to true. Do not directly check it
-    # here without checking for state_monitor.ongoing_activity_status()
-    http_condition.wait(to_sleep)
-    http_condition.release()
-    # A wakeup here due to http request coming might cause a long sleep
-    # to be interrupted early on and if no activity happened in the car,
-    # double it, that's probably an ok condition that we should not care
-    # too much about since it's guaranteed to be a "stop scraping" case
-    # anyway ("start scraping" would reset poll interval to 1 and we'll
-    # start quick polling anyway)
-    # Same thing applies to the continue case above
+    # Car gone to sleep
+    if state_monitor.vehicle['state'] == 'asleep' and previous_car_state == 'online':
+        asleep_since = int(time.time())
 
+        # Set next wake up time
+        next_wakeup = calculate_next_wakeup(next_wakeup, state_monitor)
+
+    # Car awake
+    if state_monitor.vehicle['state'] == 'online':
+        # Set next wake up time
+        next_wakeup = calculate_next_wakeup(next_wakeup, state_monitor)        
+        
+    # Car details tracking
+    previous_car_state = state_monitor.vehicle['state']
+    a_vin = state_monitor.vehicle['vin']
+    a_display_name = state_monitor.vehicle['display_name']
+    ts = int(time.time()) * 1000000000
+
+    state_body = [
+        {
+            'measurement': 'vehicle_state',
+            'tags': {
+                'vin': a_vin,
+                'display_name': a_display_name
+            },
+            'time': ts,
+            'fields': {
+                'state': previous_car_state
+            }
+        }
+    ]
+
+    if not a_dry_run:
+        # Write to DB
+        influx_client.write_points(state_body)
+
+    # Calculate poll time
+    if previous_car_state == 'asleep' and a_allow_sleep:
+        logger.debug('Car is probably asleep, we will let it sleep...')
+        #poll_interval = a_sleep_poll_secs
+
+    processing_time = int(time.time()) - busy_since
+
+    # If we spent too much time in processing, warn here
+    # Reasons might be multiple like say slow DB or slow tesla api
+    if processing_time > 120:
+        logger.warning('Too long processing loop: ' + str(processing_time) + ' seconds... Tesla server or DB slow?')
+
+    # Update console
+    logger.info('Current state: {0}{1} - next check {2} secs - next wake up scheduled for {3}'.format(previous_car_state, ' and {}'.format(car_active_status) if previous_car_state != 'asleep' else ' since {}'.format(time.ctime(asleep_since)), str(poll_interval), time.ctime(next_wakeup)))        
+
+    # Flush logging
     sys.stdout.flush()
+
+    first_run = False
+
+    # Sleep as long as we need to
+    if poll_interval != None:
+        # Check we don't have a wake up due before the next normal poll
+        if (int(time.time()) + poll_interval) > next_wakeup:
+            poll_interval = next_wakeup - int(time.time())
+        
+        # Sleep
+        time.sleep(poll_interval)

@@ -4,8 +4,6 @@ from pathlib import Path
 
 import srtm
 
-
-
 def elevationtoinflux(lat, lon, vin, displayname, ts, ifclient, dryrun, logger):
     if not os.path.isfile('srtm.lck.' + str(os.getpid())):
         Path('srtm.lck.' + str(os.getpid())).touch()
@@ -31,4 +29,3 @@ def elevationtoinflux(lat, lon, vin, displayname, ts, ifclient, dryrun, logger):
             ifclient.write_points(elev_json_body)
     else:
         print("Lockfile detected, skipping")
-    sys.exit()

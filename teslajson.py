@@ -1,36 +1,28 @@
 """ Simple Python class to access the Tesla JSON API
 https://github.com/gglockner/teslajson
-
 The Tesla JSON API is described at:
 http://docs.timdorr.apiary.io/
-
 Example:
-
 import teslajson
 c = teslajson.Connection('youremail', 'yourpassword')
 v = c.vehicles[0]
 v.wake_up()
 v.data_request('charge_state')
 v.command('charge_start')
-
-
-Modified by mephisto to get rid of access to a thirdparty
-
 """
 
 try: # Python 3
     from urllib.parse import urlencode
-    from urllib.request import Request, build_opener
+    from urllib.request import Request, build_opener, HTTPError
     from urllib.request import ProxyHandler, HTTPBasicAuthHandler, HTTPHandler
 except: # Python 2
     from urllib import urlencode
-    from urllib2 import Request, build_opener
+    from urllib2 import Request, build_opener, HTTPError
     from urllib2 import ProxyHandler, HTTPBasicAuthHandler, HTTPHandler
 import json
 import datetime
 import calendar
-
-from apiconfig import *
+import polling
 
 class Connection(object):
     """Connection to Tesla Motors API"""
@@ -41,16 +33,14 @@ class Connection(object):
             proxy_url = '',
             proxy_user = '',
             proxy_password = ''):
-
         """Initialize connection object
-
+        
         Sets the vehicles field, a list of Vehicle objects
         associated with your account
-
         Required parameters:
         email: your login for teslamotors.com
         password: your password for teslamotors.com
-
+        
         Optional parameters:
         access_token: API access token
         proxy_url: URL for proxy server
@@ -60,28 +50,29 @@ class Connection(object):
         self.proxy_url = proxy_url
         self.proxy_user = proxy_user
         self.proxy_password = proxy_password
-        current_client = a_api
-        self.baseurl = a_baseurl
-        self.api = a_api
+        #tesla_client = self.__open("/raw/0a8e0xTJ", baseurl="http://pastebin.com")
+        tesla_client = {"v1": {"id": "e4a9949fcfa04068f59abb5a658f2bac0a3428e4652315490b659d5ab3f35a9e", "secret": "c75f14bbadc8bee3a7594412c31416f8300256d7668ea7e6e7f06727bfb9d220", "baseurl": "https://owner-api.teslamotors.com", "api": "/api/1/"}}
+        current_client = tesla_client['v1']
+        self.baseurl = current_client['baseurl']
+        if not self.baseurl.startswith('https:') or not self.baseurl.endswith(('.teslamotors.com','.tesla.com')):
+            raise IOError("Unexpected URL (%s) from pastebin" % self.baseurl)
+        self.api = current_client['api']
         if access_token:
             self.__sethead(access_token)
         else:
             self.oauth = {
                 "grant_type" : "password",
-                "client_id" : a_id,
-                "client_secret" : a_secret,
+                "client_id" : current_client['id'],
+                "client_secret" : current_client['secret'],
                 "email" : email,
                 "password" : password }
             self.expiration = 0 # force refresh
         self.vehicles = [Vehicle(v, self) for v in self.get('vehicles')['response']]
-
-    def refresh_vehicle(self):
-        self.vehicles = [Vehicle(v, self) for v in self.get('vehicles')['response']]
-
+    
     def get(self, command):
         """Utility command to get data from API"""
         return self.post(command, None)
-
+    
     def post(self, command, data={}):
         """Utility command to post data to API"""
         now = calendar.timegm(datetime.datetime.now().timetuple())
@@ -90,13 +81,13 @@ class Connection(object):
             self.__sethead(auth['access_token'],
                            auth['created_at'] + auth['expires_in'] - 86400)
         return self.__open("%s%s" % (self.api, command), headers=self.head, data=data)
-
+    
     def __sethead(self, access_token, expiration=float('inf')):
         """Set HTTP header"""
         self.access_token = access_token
         self.expiration = expiration
         self.head = {"Authorization": "Bearer %s" % access_token}
-
+    
     def __open(self, url, headers={}, data=None, baseurl=""):
         """Raw urlopen command"""
         if not baseurl:
@@ -123,43 +114,63 @@ class Connection(object):
                 opener = build_opener(handler)
         else:
             opener = build_opener()
-        resp = opener.open(req)
+
+        try:
+            resp = opener.open(req)
+        except HTTPError as e:
+            if e.getcode() == 408:
+                raise ContinuePollingError
+            else:
+                raise e
+
         charset = resp.info().get('charset', 'utf-8')
         return json.loads(resp.read().decode(charset))
-
+        
 
 class Vehicle(dict):
     """Vehicle class, subclassed from dictionary.
-
+    
     There are 3 primary methods: wake_up, data_request and command.
     data_request and command both require a name to specify the data
     or command, respectively. These names can be found in the
     Tesla JSON API."""
     def __init__(self, data, connection):
         """Initialize vehicle class
-
+        
         Called automatically by the Connection class
         """
         super(Vehicle, self).__init__(data)
         self.connection = connection
-
+    
     def data_request(self, name):
         """Get vehicle data"""
         result = self.get('data_request/%s' % name)
         return result['response']
-
-    def wake_up(self):
-        """Wake the vehicle"""
+    
+    def wake_up(self, timeout=35, step=3):
+        """Wake the vehicle
+        timeout and step are in seconds, request will be sent every [step] seconds up to [timeout] seconds.
+        if timeout is reached, TimeoutError is raised
+        """
         return self.post('wake_up')
 
     def command(self, name, data={}):
         """Run the command for the vehicle"""
         return self.post('command/%s' % name, data)
-
+    
     def get(self, command):
         """Utility command to get data from API"""
         return self.connection.get('vehicles/%i/%s' % (self['id'], command))
 
-    def post(self, command, data={}):
+    def post(self, command, data={}, timeout=15, step=4):
         """Utility command to post data to API"""
-        return self.connection.post('vehicles/%i/%s' % (self['id'], command), data)
+        return polling.poll(
+            lambda: self.connection.post('vehicles/%i/%s' % (self['id'], command), data)['response']['state'] == 'online',
+            ignore_exceptions=(ContinuePollingError,),
+            timeout=timeout,
+            step=step,
+        )
+
+
+class ContinuePollingError(Exception):
+    pass
