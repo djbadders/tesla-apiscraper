@@ -10,7 +10,6 @@
     Changed to:
     * remove web server for mobile app
     * enhanced sleep behaviour
-    * support for tracking mulitple vehicles
     * Auto log rotation and limited disk usage
 
     Please note that the use of the Tesla REST API in general
@@ -198,7 +197,7 @@ class StateMonitor(object):
         global last_data_from_tesla
         a_lat = None
         a_long = None
-        
+
         # Request and process all Tesla states
         logger.debug('>> Request vehicle data')
         r = self.vehicle.get('vehicle_data')
